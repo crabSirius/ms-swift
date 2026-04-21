@@ -1,56 +1,12 @@
 import argparse
-import glob
 import json
 import os
-import re
 import tempfile
 from multiprocessing import freeze_support
 
-from swift.arguments import EvalArguments
-from swift.pipelines.eval import SwiftEval
-
-
-def find_latest_review_file(eval_output_dir, model_name, subset_name):
-    model_suffix = model_name.split('/')[-1]
-    pattern = os.path.join(
-        eval_output_dir,
-        'native',
-        '*',
-        'reviews',
-        model_suffix,
-        f'general_vqa_{subset_name}.jsonl')
-    candidates = glob.glob(pattern)
-    if not candidates:
-        raise FileNotFoundError(f'no review file found with pattern: {pattern}')
-    return max(candidates, key=os.path.getmtime)
-
-
-def extract_image_from_input(input_text):
-    if not isinstance(input_text, str):
-        return ''
-    m = re.search(r'gradio_api/file=([^)]+)\)', input_text)
-    if m:
-        return m.group(1).strip()
-    return ''
-
-
-def export_pred_jsonl(review_path, pred_out):
-    with open(review_path, 'r', encoding='utf-8') as fin, open(pred_out, 'w', encoding='utf-8') as fout:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            score_info = row.get('sample_score', {}).get('score', {})
-            prediction = score_info.get('prediction', '')
-            target = row.get('target', '')
-            image_path = extract_image_from_input(row.get('input', ''))
-            pred_row = {
-                'images': [image_path] if image_path else [],
-                'prediction': prediction,
-                'target': target
-            }
-            fout.write(json.dumps(pred_row, ensure_ascii=False) + '\n')
+from swift.arguments import InferArguments
+from swift.pipelines.infer import infer_main
+from swift.utils import read_from_jsonl
 
 
 def _first_ref(objects):
@@ -80,17 +36,27 @@ def _build_assistant_target(objects):
     return json.dumps(payload, ensure_ascii=False)
 
 
-def prepare_subset_with_replaced_placeholders(local_path, subset, eval_output_dir):
+def prepare_infer_dataset(local_path, subset, output_dir):
+    """Prepare the dataset JSONL for swift infer.
+
+    Handles two data formats:
+    1. Objects-based: messages with <ref-object>/<bbox> placeholders + objects field
+    2. Answer-based: messages + answer field
+
+    Adds an assistant message as ground truth so InferRequest.remove_response
+    can extract it as labels.
+    """
     src_path = os.path.join(local_path, f'{subset}.jsonl')
     if not os.path.exists(src_path):
         raise FileNotFoundError(f'subset file not found: {src_path}')
 
-    prepared_root = os.path.join(eval_output_dir, '_prepared_dataset')
+    prepared_root = os.path.join(output_dir, '_prepared_dataset')
     os.makedirs(prepared_root, exist_ok=True)
-    prepared_dir = tempfile.mkdtemp(prefix='general_vqa_', dir=prepared_root)
+    prepared_dir = tempfile.mkdtemp(prefix='infer_', dir=prepared_root)
     dst_path = os.path.join(prepared_dir, f'{subset}.jsonl')
 
-    with open(src_path, 'r', encoding='utf-8') as fin, open(dst_path, 'w', encoding='utf-8') as fout:
+    with open(src_path, 'r', encoding='utf-8') as fin, \
+         open(dst_path, 'w', encoding='utf-8') as fout:
         for line in fin:
             raw = line.strip()
             if not raw:
@@ -110,53 +76,94 @@ def prepare_subset_with_replaced_placeholders(local_path, subset, eval_output_di
                         continue
                     if '<ref-object>' in content and ref_name:
                         content = content.replace('<ref-object>', ref_name)
-                    if msg.get('role') == 'assistant' and ('<bbox>' in content or '<ref-object>' in content):
+                    if msg.get('role') == 'assistant' and (
+                            '<bbox>' in content or '<ref-object>' in content):
                         content = assistant_target
                     msg['content'] = content
                 row['messages'] = messages
 
-            fout.write(json.dumps(row, ensure_ascii=False) + '\n')
+            has_assistant = any(
+                isinstance(m, dict) and m.get('role') == 'assistant'
+                for m in messages)
+            if not has_assistant:
+                answer = row.get('answer', '')
+                if not answer and assistant_target != '[]':
+                    answer = assistant_target
+                if answer:
+                    messages.append({'role': 'assistant', 'content': answer})
+                    row['messages'] = messages
 
-    return prepared_dir
+            out_row = {'messages': row['messages']}
+            for key in ('images', 'videos', 'audios'):
+                if key in row:
+                    out_row[key] = row[key]
+            fout.write(json.dumps(out_row, ensure_ascii=False) + '\n')
+
+    return dst_path
+
+
+def export_pred_jsonl(result_path, pred_out):
+    data_list = read_from_jsonl(result_path)
+    with open(pred_out, 'w', encoding='utf-8') as fout:
+        for data in data_list:
+            prediction = data.get('response', '')
+            target = data.get('labels', '') or ''
+            images = data.get('images', [])
+            pred_row = {
+                'images': images if images else [],
+                'prediction': prediction,
+                'target': target,
+            }
+            fout.write(json.dumps(pred_row, ensure_ascii=False) + '\n')
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='Qwen/Qwen3-VL-8B-Instruct')
-    parser.add_argument('--local_path', default='/root/liantaoding_dev/codes/ms-swift')
+    parser.add_argument('--local_path',
+                        default='/root/liantaoding_dev/codes/ms-swift')
     parser.add_argument('--subset', default='test_eval')
-    parser.add_argument('--eval_output_dir', default='eval_output')
-    parser.add_argument('--eval_limit', type=int, default=10)
+    parser.add_argument('--output_dir', default='infer_output')
+    parser.add_argument('--eval_limit', type=int, default=None)
     parser.add_argument('--pred_out', default='pred.jsonl')
+    parser.add_argument('--infer_backend', default='transformers',
+                        choices=['vllm', 'transformers', 'sglang', 'lmdeploy'])
     return parser.parse_args()
 
 
-def run_eval_and_export(args):
-    prepared_local_path = prepare_subset_with_replaced_placeholders(
-        local_path=args.local_path, subset=args.subset, eval_output_dir=args.eval_output_dir)
-    eval_args = EvalArguments(
+def run_infer_and_export(args):
+    prepared_path = prepare_infer_dataset(
+        local_path=args.local_path,
+        subset=args.subset,
+        output_dir=args.output_dir)
+
+    result_path = os.path.join(args.output_dir, f'{args.subset}_result.jsonl')
+
+    infer_args = InferArguments(
         model=args.model,
-        eval_dataset=['general_vqa'],
-        eval_dataset_args={
-            'general_vqa': {
-                'local_path': prepared_local_path,
-                'subset_list': [args.subset],
-                'metric_list': ['Rouge']
-            }
-        },
-        eval_output_dir=args.eval_output_dir,
-        eval_num_proc=1,
-        eval_limit=args.eval_limit)
-    SwiftEval(eval_args).main()
-    review_path = find_latest_review_file(args.eval_output_dir, args.model, args.subset)
-    export_pred_jsonl(review_path, args.pred_out)
+        model_type='qwen3_vl',
+        template='qwen3_vl',
+        infer_backend=args.infer_backend,
+        val_dataset=[prepared_path],
+        val_dataset_sample=args.eval_limit,
+        result_path=result_path,
+        temperature=0.3,
+        max_new_tokens=2048,
+        top_k=20,
+        top_p=0.7,
+        repetition_penalty=1.05,
+        stream=False)
+
+    infer_main(infer_args)
+
+    export_pred_jsonl(result_path, args.pred_out)
     print(f'generated: {args.pred_out}')
-    print(f'from review: {review_path}')
+    print(f'from result: {result_path}')
 
 
 def main():
     args = parse_args()
-    run_eval_and_export(args)
+    run_infer_and_export(args)
 
 
 if __name__ == '__main__':

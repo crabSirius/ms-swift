@@ -176,7 +176,7 @@ def parse_args():
     parser.add_argument('--gt_jsonl', default='test.jsonl')
     parser.add_argument('--pred_jsonl', default='pred.jsonl')
     parser.add_argument('--iou_threshold', type=float, default=0.5)
-    parser.add_argument('--max_samples', type=int, default=10)
+    parser.add_argument('--max_samples', type=int, default=None)
     parser.add_argument('--ignore_label', action='store_true')
     return parser.parse_args()
 
