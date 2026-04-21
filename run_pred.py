@@ -3,6 +3,7 @@ import glob
 import json
 import os
 import re
+import tempfile
 from multiprocessing import freeze_support
 
 from swift.arguments import EvalArguments
@@ -52,6 +53,73 @@ def export_pred_jsonl(review_path, pred_out):
             fout.write(json.dumps(pred_row, ensure_ascii=False) + '\n')
 
 
+def _first_ref(objects):
+    refs = objects.get('ref', [])
+    if isinstance(refs, list):
+        for ref in refs:
+            if isinstance(ref, str) and ref.strip():
+                return ref.strip()
+        return ''
+    if isinstance(refs, str):
+        return refs.strip()
+    return ''
+
+
+def _build_assistant_target(objects):
+    bboxes = objects.get('bbox', [])
+    if not isinstance(bboxes, list):
+        return '[]'
+    ref_name = _first_ref(objects)
+    if not bboxes:
+        return '[]'
+    payload = []
+    for bbox in bboxes:
+        if not isinstance(bbox, list):
+            continue
+        payload.append({'bbox_2d': bbox, 'label': ref_name})
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def prepare_subset_with_replaced_placeholders(local_path, subset, eval_output_dir):
+    src_path = os.path.join(local_path, f'{subset}.jsonl')
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(f'subset file not found: {src_path}')
+
+    prepared_root = os.path.join(eval_output_dir, '_prepared_dataset')
+    os.makedirs(prepared_root, exist_ok=True)
+    prepared_dir = tempfile.mkdtemp(prefix='general_vqa_', dir=prepared_root)
+    dst_path = os.path.join(prepared_dir, f'{subset}.jsonl')
+
+    with open(src_path, 'r', encoding='utf-8') as fin, open(dst_path, 'w', encoding='utf-8') as fout:
+        for line in fin:
+            raw = line.strip()
+            if not raw:
+                continue
+            row = json.loads(raw)
+            objects = row.get('objects', {})
+            ref_name = _first_ref(objects)
+            assistant_target = _build_assistant_target(objects)
+
+            messages = row.get('messages', [])
+            if isinstance(messages, list):
+                for msg in messages:
+                    if not isinstance(msg, dict):
+                        continue
+                    content = msg.get('content')
+                    if not isinstance(content, str):
+                        continue
+                    if '<ref-object>' in content and ref_name:
+                        content = content.replace('<ref-object>', ref_name)
+                    if msg.get('role') == 'assistant' and ('<bbox>' in content or '<ref-object>' in content):
+                        content = assistant_target
+                    msg['content'] = content
+                row['messages'] = messages
+
+            fout.write(json.dumps(row, ensure_ascii=False) + '\n')
+
+    return prepared_dir
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='Qwen/Qwen3-VL-8B-Instruct')
@@ -64,14 +132,16 @@ def parse_args():
 
 
 def run_eval_and_export(args):
+    prepared_local_path = prepare_subset_with_replaced_placeholders(
+        local_path=args.local_path, subset=args.subset, eval_output_dir=args.eval_output_dir)
     eval_args = EvalArguments(
         model=args.model,
         eval_dataset=['general_vqa'],
         eval_dataset_args={
             'general_vqa': {
-                'local_path': args.local_path,
+                'local_path': prepared_local_path,
                 'subset_list': [args.subset],
-                'metric_list': ['BLEU', 'Rouge']
+                'metric_list': ['Rouge']
             }
         },
         eval_output_dir=args.eval_output_dir,
