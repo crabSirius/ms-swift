@@ -120,6 +120,10 @@ def export_pred_jsonl(result_path, pred_out):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='Qwen/Qwen3-VL-8B-Instruct')
+    parser.add_argument('--adapters', nargs='*', default=[],
+                        help='LoRA adapter paths, e.g. output/v1/checkpoint-250')
+    parser.add_argument('--merge_lora', action='store_true',
+                        help='Merge LoRA weights into the base model before inference')
     parser.add_argument('--local_path',
                         default='/root/liantaoding_dev/codes/ms-swift')
     parser.add_argument('--subset', default='test_eval')
@@ -139,7 +143,7 @@ def run_infer_and_export(args):
 
     result_path = os.path.join(args.output_dir, f'{args.subset}_result.jsonl')
 
-    infer_args = InferArguments(
+    infer_kwargs = dict(
         model=args.model,
         model_type='qwen3_vl',
         template='qwen3_vl',
@@ -153,6 +157,13 @@ def run_infer_and_export(args):
         top_p=0.7,
         repetition_penalty=1.05,
         stream=False)
+
+    if args.adapters:
+        infer_kwargs['adapters'] = args.adapters
+    if args.merge_lora:
+        infer_kwargs['merge_lora'] = True
+
+    infer_args = InferArguments(**infer_kwargs)
 
     infer_main(infer_args)
 
