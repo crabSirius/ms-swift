@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import tempfile
 from multiprocessing import freeze_support
 
 from swift.arguments import InferArguments
@@ -52,7 +51,9 @@ def prepare_infer_dataset(local_path, subset, output_dir):
 
     prepared_root = os.path.join(output_dir, '_prepared_dataset')
     os.makedirs(prepared_root, exist_ok=True)
-    prepared_dir = tempfile.mkdtemp(prefix='infer_', dir=prepared_root)
+    safe_subset = subset.replace('/', '_').replace('\\', '_')
+    prepared_dir = os.path.join(prepared_root, f'infer_{safe_subset}')
+    os.makedirs(prepared_dir, exist_ok=True)
     dst_path = os.path.join(prepared_dir, f'{subset}.jsonl')
 
     with open(src_path, 'r', encoding='utf-8') as fin, \
