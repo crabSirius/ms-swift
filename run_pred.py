@@ -121,14 +121,14 @@ def export_pred_jsonl(result_path, pred_out):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='Qwen/Qwen3-VL-8B-Instruct')
-    parser.add_argument('--adapters', nargs='*', default=['/root/liantaoding_dev/codes/ms-swift/output/v1/checkpoint-250'],
+    parser.add_argument('--adapters', nargs='*', default=[],
                         help='LoRA adapter paths, e.g. output/v1/checkpoint-250')
-    parser.add_argument('--merge_lora', default=True,
+    parser.add_argument('--merge_lora', default=False,
                         help='Merge LoRA weights into the base model before inference')
     parser.add_argument('--local_path',
                         default='/root/liantaoding_datas/images/damage_tree/damage_tree_0910/ms_swift')
     parser.add_argument('--subset', default='tree_damage_per_label_with_negatives')
-    parser.add_argument('--output_dir', default='eval_output_0910')
+    parser.add_argument('--output_dir', default='eval_output_0910_base')
     parser.add_argument('--eval_limit', type=int, default=None)
     parser.add_argument('--pred_out', default='pred.jsonl')
     parser.add_argument('--infer_backend', default='transformers',
